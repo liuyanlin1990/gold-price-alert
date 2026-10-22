@@ -37,7 +37,7 @@ jobs:
           SMTP_AUTH_CODE: ${{ secrets.SMTP_AUTH_CODE }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-          MONITOR_SECONDS: "780"   # 单次 Run 内连续监测 13 分钟
+          MONITOR_SECONDS: "540"   # 单次 Run 内连续监测 9 分钟（外部定时器每 10 分钟触发，避免重叠）
           MONITOR_INTERVAL: "60"   # 每 60 秒抓一次价
         run: python gold_alert.py
 
