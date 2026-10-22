@@ -6,7 +6,10 @@
   "smtp_auth_code": "",
   "mail_to": "",
   "symbol": "gds_AU9999",
-  "threshold": 880.0,
+
+  "_阈值说明": "监控的是上金所 Au99.99（沪金99）。工行积存金报价约比沪金99 低 icbc_spread 元/克，所以想等积存金跌破 880 时，沪金99 阈值应设为 880 - icbc_spread ≈ 882。",
+  "threshold": 882.0,
+  "icbc_spread": -2.03,
   "check_times": ["每15分钟"],
   "alert_cooldown_minutes": 60,
 

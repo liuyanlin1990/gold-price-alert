@@ -393,6 +393,8 @@ def build_markdown(info, analysis, trend, threshold, kind):
 
     lines.append("**涨跌**: {:+.2f} ({:+.2f}%)".format(change, pct))
     lines.append("**阈值**: {:.2f} 元/克".format(threshold))
+    if info.get("icbc") is not None:
+        lines.append("**工行积存金参考**: {:.2f} 元/克".format(info["icbc"]))
 
     # 历史位置
     if analysis["high"] and analysis["low"]:
@@ -400,7 +402,7 @@ def build_markdown(info, analysis, trend, threshold, kind):
         lines.append("---")
         lines.append("### 📍 历史位置（近 {} 日）".format(analysis["days_label"]))
         lines.append("- 区间最高 **{:.2f}** ｜ 最低 **{:.2f}**".format(analysis["high"], analysis["low"]))
-        lines.append("- 当前位置 **{:.0f}%** (距最低 +{:.1f}% / 距最高 -{:.1f}%)".format(
+        lines.append("- 当前位置 **{:.0f}%** (距最低 {:+.1f}% / 距最高 {:+.1f}%)".format(
             analysis["percentile"], analysis.get("pct_vs_low", 0), analysis.get("pct_vs_high", 0)))
         lines.append("- 💡 **{}**".format(analysis["advice"]))
 
@@ -432,6 +434,8 @@ def build_html(info, analysis, trend, threshold, kind):
     pct = (change / prev * 100) if prev else 0.0
     chg_txt = "上涨 +{:.2f} ({:+.2f}%)".format(change, pct) if change > 0 else \
         ("下跌 {:.2f} ({:+.2f}%)".format(change, pct) if change < 0 else "持平")
+    icbc_txt = ("{:.2f} 元/克".format(info["icbc"])
+                if info.get("icbc") is not None else "—")
 
     if kind == "alert":
         accent = "#d93025"
@@ -455,7 +459,7 @@ def build_html(info, analysis, trend, threshold, kind):
           <b>📍 历史位置（近 {days} 日）</b><br>
           区间最高 <b>{high:.2f}</b> ｜ 最低 <b>{low:.2f}</b><br>
           当前位置 <b style="color:{accent}">{pct:.0f}%</b>
-          (距最低 +{vs_low:.1f}% / 距最高 -{vs_high:.1f}%)<br>
+          (距最低 {vs_low:+.1f}% / 距最高 {vs_high:+.1f}%)<br>
           💡 <b>{advice}</b>
         </p>""".format(
             days=analysis["days_label"], high=analysis["high"], low=analysis["low"],
@@ -490,7 +494,8 @@ def build_html(info, analysis, trend, threshold, kind):
   <p style="font-size:15px;line-height:1.9;margin:0">
     现价：<b style="color:{accent};font-size:20px">{price:.2f} 元/克</b><br>
     较昨收：{chg_txt}<br>
-    你的阈值：{threshold:.2f} 元/克
+    你的阈值：{threshold:.2f} 元/克<br>
+    工行积存金参考：{icbc_txt}
   </p>
   {hist_block}
   {trend_block}
@@ -514,6 +519,11 @@ def send_message(cfg, info, kind, threshold, history_days, sendkey):
         log("趋势: {}".format(trend["summary"]))
     if trend.get("rsi") is not None:
         log("RSI(14) = {:.1f}".format(trend["rsi"]))
+
+    # 工行积存金参考价（= 沪金99 + icbc_spread）
+    spread = float(cfg.get("icbc_spread", 0) or 0)
+    if spread:
+        info["icbc"] = info["price"] + spread
 
     title = build_title(info, threshold, kind)
     md = build_markdown(info, analysis, trend, threshold, kind)
@@ -541,6 +551,17 @@ def check_once(cfg, state):
     near = (not below) and (price - threshold <= near_margin)
     log("{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 跌破={} | 接近={}".format(
         info["name"], price, threshold, below, near))
+
+    # 休市判断：报价时间超过 20 分钟未更新，说明金交所已收盘，避免用冻结价反复报警
+    try:
+        quote_dt = datetime.strptime(
+            info["date"] + " " + info["time"], "%Y-%m-%d %H:%M:%S")
+        if (now - quote_dt).total_seconds() > 20 * 60:
+            log("行情未更新（报价 {} {}，休市中），跳过本次判断".format(
+                info["date"], info["time"]))
+            return False
+    except (ValueError, KeyError):
+        pass
 
     sent_any = False
 
