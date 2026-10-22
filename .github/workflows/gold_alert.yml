@@ -2,8 +2,7 @@ name: Gold Price Alert
 
 on:
   schedule:
-    # 注意：GitHub Actions cron 是 UTC 时区，北京时间 = UTC + 8
-    # */15 表示每 15 分钟运行一次（24 小时不间断）
+    # GitHub Actions cron 使用 UTC 时区；*/15 表示每 15 分钟一次（24 小时不间断）
     - cron: "*/15 * * * *"
   workflow_dispatch:  # 允许手动触发测试
 
@@ -13,6 +12,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,13 +22,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 从上一次运行恢复 state.json（实现冷却/每日播报幂等性）
+      # 从上一次运行恢复 state.json（冷却 / 每日播报幂等）
       - name: Restore state
-        uses: actions/download-artifact@v4
-        continue-on-error: true
+        uses: actions/cache/restore@v4
         with:
-          name: gold-state
-          path: .
+          path: state.json
+          key: gold-state-${{ github.run_id }}
+          restore-keys: |
+            gold-state-
 
       - name: Run gold_alert.py
         env:
@@ -36,20 +37,22 @@ jobs:
           SMTP_AUTH_CODE: ${{ secrets.SMTP_AUTH_CODE }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          MONITOR_SECONDS: "780"   # 单次 Run 内连续监测 13 分钟
+          MONITOR_INTERVAL: "60"   # 每 60 秒抓一次价
         run: python gold_alert.py
 
-      # 上传 state.json 供下次运行恢复（保留 14 天）
-      - name: Upload state
-        uses: actions/upload-artifact@v4
+      # 保存本次 state.json 供后续 Run 恢复
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
         with:
-          name: gold-state
           path: state.json
-          retention-days: 14
+          key: gold-state-${{ github.run_id }}
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gold-logs
+          name: gold-logs-${{ github.run_id }}
           path: logs/run.log
           retention-days: 7

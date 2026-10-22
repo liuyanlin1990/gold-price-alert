@@ -6,19 +6,21 @@
 推送方式：Server酱（微信推送，主通道） + QQ 邮箱（备份通道）。
 
 规则：
-- 每 15 分钟运行一次（GitHub Actions cron）。
-- 每天第一次运行 → 发送一封「每日播报」。
-- 之后运行 → 跌破阈值才发「金价提醒」，alert_cooldown_minutes 内不重复。
+- GitHub Actions 每 15 分钟触发一次；每次 Run 内连续监测 monitor_seconds 秒，
+  每 monitor_interval 秒抓一次价（采样密度≈1 分钟/次）。
+- 每天第一条运行 → 发送一封「每日播报」。
+- 跌破阈值 → 发「金价提醒」，alert_cooldown_minutes 内不重复。
+- 高于阈值但差距小于 near_threshold_margin → 每天发一次「接近阈值」预警。
 - 每次消息都包含：现价 + 历史百分位 + 技术指标趋势判断。
 - 敏感字段优先从同名环境变量读取，方便云端 Secrets 注入。
 """
 
 import json
-import math
 import os
 import re
 import smtplib
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -362,23 +364,29 @@ def push_mail(cfg, subject, html):
 DISCLAIMER = "_⚠️ 以上分析基于历史数据和技术指标，仅供参考，不构成投资建议。_"
 
 
-def build_title(info, threshold, triggered):
+def build_title(info, threshold, kind):
     price = info["price"]
-    if triggered:
+    if kind == "alert":
         return "【金价提醒】{:.2f} 低于阈值 {:.2f}".format(price, threshold)
+    if kind == "near":
+        return "【接近阈值】{:.2f} 元/克".format(price)
     return "【金价播报】{:.2f} 元/克".format(price)
 
 
-def build_markdown(info, analysis, trend, threshold, triggered):
+def build_markdown(info, analysis, trend, threshold, kind):
     price = info["price"]
     prev = info["prev"]
     change = price - prev
     pct = (change / prev * 100) if prev else 0.0
 
     lines = []
-    if triggered:
+    if kind == "alert":
         lines.append("### 🔔 金价提醒")
         lines.append("**现价 {:.2f} 元/克** 已低于阈值 {:.2f}！".format(price, threshold))
+    elif kind == "near":
+        lines.append("### ⚠️ 接近阈值")
+        lines.append("**现价 {:.2f} 元/克**，距阈值 {:.2f} 仅差 {:.2f} 元".format(
+            price, threshold, price - threshold))
     else:
         lines.append("### 📊 金价播报")
         lines.append("**现价 {:.2f} 元/克**".format(price))
@@ -417,7 +425,7 @@ def build_markdown(info, analysis, trend, threshold, triggered):
     return "\n".join(lines)
 
 
-def build_html(info, analysis, trend, threshold, triggered):
+def build_html(info, analysis, trend, threshold, kind):
     price = info["price"]
     prev = info["prev"]
     change = price - prev
@@ -425,10 +433,14 @@ def build_html(info, analysis, trend, threshold, triggered):
     chg_txt = "上涨 +{:.2f} ({:+.2f}%)".format(change, pct) if change > 0 else \
         ("下跌 {:.2f} ({:+.2f}%)".format(change, pct) if change < 0 else "持平")
 
-    if triggered:
+    if kind == "alert":
         accent = "#d93025"
         title_text = "金价低于阈值提醒"
         head = '<b style="color:#d93025;font-size:18px">🔔 金价提醒</b>'
+    elif kind == "near":
+        accent = "#b26a00"
+        title_text = "金价接近阈值提醒"
+        head = '<b style="color:#b26a00;font-size:18px">⚠️ 接近阈值</b>'
     else:
         accent = "#1a7f37"
         title_text = "金价播报"
@@ -488,75 +500,117 @@ def build_html(info, analysis, trend, threshold, triggered):
     return title_text, html
 
 
-# ── 主流程 ───────────────────────────────────────────────────────────────
-def main():
-    cfg = load_config()
+# ── 单次检查 ──────────────────────────────────────────────────────────────
+def send_message(cfg, info, kind, threshold, history_days, sendkey):
+    """抓历史数据、生成分析并推送（Server酱 + 邮件）。"""
+    history = fetch_history(history_days)
+    analysis = analyze_price(history, info["price"], str(history_days))
+    trend = analyze_trend(history)
+
+    if analysis["percentile"] is not None:
+        log("近 {}日 高 {:.2f} / 低 {:.2f} / 位置 {:.0f}%".format(
+            analysis["days_label"], analysis["high"], analysis["low"], analysis["percentile"]))
+    if trend["summary"]:
+        log("趋势: {}".format(trend["summary"]))
+    if trend.get("rsi") is not None:
+        log("RSI(14) = {:.1f}".format(trend["rsi"]))
+
+    title = build_title(info, threshold, kind)
+    md = build_markdown(info, analysis, trend, threshold, kind)
+    _, html = build_html(info, analysis, trend, threshold, kind)
+    push_serverchan(sendkey, title, md)
+    push_mail(cfg, title, html)
+    log("[{}] 推送完成: {}".format(kind, title))
+
+
+def check_once(cfg, state):
+    """抓一次价格并判断是否需要推送，state 会被就地更新。"""
     threshold = float(cfg.get("threshold", 0))
     cooldown_minutes = int(cfg.get("alert_cooldown_minutes", 60))
     history_days = int(cfg.get("history_days", 60))
+    near_margin = float(cfg.get("near_threshold_margin", 2.0))
     symbol = cfg.get("symbol", "gds_AU9999")
     sendkey = env_or_cfg(cfg, "serverchan_sendkey", "SERVERCHAN_SENDKEY")
 
-    try:
-        now = datetime.now()
-        today = now.strftime("%Y-%m-%d")
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
 
-        info = fetch_price(symbol)
-        triggered = info["price"] < threshold
-        log("{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 触发={}".format(
-            info["name"], info["price"], threshold, triggered))
+    info = fetch_price(symbol)
+    price = info["price"]
+    below = price < threshold
+    near = (not below) and (price - threshold <= near_margin)
+    log("{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 跌破={} | 接近={}".format(
+        info["name"], price, threshold, below, near))
 
-        # 历史 + 趋势
-        history = fetch_history(history_days)
-        analysis = analyze_price(history, info["price"], str(history_days))
-        trend = analyze_trend(history)
+    sent_any = False
 
-        if analysis["percentile"] is not None:
-            log("近 {}日 高 {:.2f} / 低 {:.2f} / 位置 {:.0f}%".format(
-                analysis["days_label"], analysis["high"], analysis["low"], analysis["percentile"]))
-        if trend["summary"]:
-            log("趋势: {}".format(trend["summary"]))
-        if trend.get("rsi") is not None:
-            log("RSI(14) = {:.1f}".format(trend["rsi"]))
-
-        state = load_state()
-        sent_any = False
-
-        # 1) 跌破阈值 → 检查冷却时间
+    # 1) 跌破阈值 → 冷却判断
+    if below:
         last_alert = parse_ts(state.get("last_alert_ts"))
         cooldown_ok = (last_alert is None or
                        (now - last_alert).total_seconds() >= cooldown_minutes * 60)
-
-        if triggered and cooldown_ok:
-            title = build_title(info, threshold, True)
-            md = build_markdown(info, analysis, trend, threshold, True)
-            _, html = build_html(info, analysis, trend, threshold, True)
-            push_serverchan(sendkey, title, md)
-            push_mail(cfg, title, html)
+        if cooldown_ok:
+            send_message(cfg, info, "alert", threshold, history_days, sendkey)
             state["last_alert_ts"] = now.isoformat()
             state["last_alert_date"] = today
             sent_any = True
             log("跌破阈值提醒已推送（冷却 {} 分钟）".format(cooldown_minutes))
-        elif triggered and not cooldown_ok:
+        else:
             remaining = cooldown_minutes * 60 - int((now - last_alert).total_seconds())
-            log("跌破阈值但冷却中，剩余 {} 秒".format(remaining))
+            log("跌破阈值但冷却中，剩余 {} 秒".format(max(remaining, 0)))
 
-        # 2) 每天第一次运行 → 每日播报（若本次已发提醒则不重复发）
-        if state.get("last_digest_date") != today:
-            if not sent_any:
-                title = build_title(info, threshold, False)
-                md = build_markdown(info, analysis, trend, threshold, False)
-                _, html = build_html(info, analysis, trend, threshold, False)
-                push_serverchan(sendkey, title, md)
-                push_mail(cfg, title, html)
-                sent_any = True
-                log("每日播报已推送")
-            state["last_digest_date"] = today
-
-        save_state(state)
+    # 2) 每天第一条：每日播报（本次已发提醒则不重复）
+    if state.get("last_digest_date") != today:
         if not sent_any:
-            log("本次无需发送（今日已播报，{}）".format(
-                "现价未跌破阈值" if not triggered else "提醒冷却中"))
+            send_message(cfg, info, "digest", threshold, history_days, sendkey)
+            sent_any = True
+            log("每日播报已推送")
+        state["last_digest_date"] = today
+
+    # 3) 接近阈值（每天最多提醒一次）
+    elif near and state.get("last_near_date") != today:
+        send_message(cfg, info, "near", threshold, history_days, sendkey)
+        state["last_near_date"] = today
+        sent_any = True
+
+    if not sent_any:
+        log("本次无需发送（今日已播报，{}）".format(
+            "跌破但冷却中" if below else "未跌破阈值"))
+    return below and sent_any
+
+
+# ── 主流程 ───────────────────────────────────────────────────────────────
+def monitor(cfg, seconds, interval):
+    """在同一个 Run 内循环监测，显著提高采样密度。"""
+    state = load_state()
+    deadline = time.monotonic() + seconds
+    log("开始循环监测：窗口 {} 秒，间隔 {} 秒".format(seconds, interval))
+    while True:
+        try:
+            check_once(cfg, state)
+            save_state(state)
+        except Exception as e:
+            log("本次检查失败: {}: {}".format(type(e).__name__, e))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+    log("循环监测窗口结束")
+    return 0
+
+
+def main():
+    cfg = load_config()
+    loop_seconds = int(os.environ.get("MONITOR_SECONDS") or cfg.get("monitor_seconds", 0))
+    interval = int(os.environ.get("MONITOR_INTERVAL") or cfg.get("monitor_interval", 60))
+
+    if loop_seconds > 0:
+        return monitor(cfg, loop_seconds, max(interval, 10))
+
+    state = load_state()
+    try:
+        check_once(cfg, state)
+        save_state(state)
         return 0
     except Exception as e:
         log("执行失败: {}: {}".format(type(e).__name__, e))

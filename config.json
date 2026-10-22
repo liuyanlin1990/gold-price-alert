@@ -10,6 +10,13 @@
   "check_times": ["每15分钟"],
   "alert_cooldown_minutes": 60,
 
+  "_循环监测": "每次 Run 内连续监测 monitor_seconds 秒，每 monitor_interval 秒抓一次价（采样密度≈1分钟/次）。0 表示只抓一次。",
+  "monitor_seconds": 780,
+  "monitor_interval": 60,
+
+  "_接近阈值预警": "现价高于阈值但差距小于 near_threshold_margin 元时，每天提醒一次，提前给你准备时间。",
+  "near_threshold_margin": 2.0,
+
   "_历史分析": "近 history_days 天的最高最低 + 当前价在区间的百分位 + MA均线 + RSI趋势判断",
   "history_days": 60,
 
