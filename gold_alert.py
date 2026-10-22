@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""每日金价查询 + 历史位置分析 + 多通道推送。
+"""金价持续监测 + 历史位置分析 + 趋势判断 + 多通道推送。
 
 数据源：新浪财经贵金属行情接口（实时价 + 历史日线）。
 推送方式：Server酱（微信推送，主通道） + QQ 邮箱（备份通道）。
 
 规则：
-- 每天第一次运行 → 发送一封「每日播报」（现价 + 历史分析 + 阈值对比）；
-- 之后每次运行 → 只有当现价跌破阈值时，才立即加发一封「金价提醒」；
-- alert_once_per_day=true 时，同一天最多只发一次跌破提醒。
-- 敏感字段（smtp_auth_code / serverchan_sendkey）优先从同名环境变量读取，
-  方便在 GitHub Actions / 云函数等云端环境通过 Secrets 注入。
+- 每 15 分钟运行一次（GitHub Actions cron）。
+- 每天第一次运行 → 发送一封「每日播报」。
+- 之后运行 → 跌破阈值才发「金价提醒」，alert_cooldown_minutes 内不重复。
+- 每次消息都包含：现价 + 历史百分位 + 技术指标趋势判断。
+- 敏感字段优先从同名环境变量读取，方便云端 Secrets 注入。
 """
 
 import json
+import math
 import os
 import re
 import smtplib
@@ -32,13 +33,11 @@ STATE_PATH = os.path.join(BASE_DIR, "state.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 
 # ── 新浪接口 ──────────────────────────────────────────────────────────────
-# 实时行情（上海黄金交易所 Au9999）
 SINA_URL = "https://hq.sinajs.cn/list={symbol}"
 SINA_HEADERS = {
     "Referer": "https://finance.sina.com.cn",
     "User-Agent": "Mozilla/5.0",
 }
-# 历史日线（tab 分隔 / GBK / 字段：日期 合约 开盘 最高 最低 收盘 …）
 HISTORY_URL = (
     "http://vip.stock.finance.sina.com.cn/q/view/"
     "download_gold_history.php?breed={breed}&start={start}&end={end}"
@@ -64,7 +63,6 @@ def load_config():
 
 
 def env_or_cfg(cfg, key, env_key=None, default=""):
-    """优先从环境变量取值，其次从 config.json，最后 default。"""
     env = os.environ.get(env_key or key)
     if env:
         return env.strip()
@@ -77,7 +75,7 @@ def load_state():
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return {}
 
@@ -90,9 +88,18 @@ def save_state(state):
         pass
 
 
+def parse_ts(ts_str):
+    """把 state.json 里的 ISO 时间字符串转回 datetime。"""
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str)
+    except Exception:
+        return None
+
+
 # ── 实时行情 ──────────────────────────────────────────────────────────────
 def fetch_price(symbol):
-    """返回 {symbol, name, price, prev, date, time}"""
     req = urllib.request.Request(
         SINA_URL.format(symbol=symbol), headers=SINA_HEADERS
     )
@@ -101,13 +108,12 @@ def fetch_price(symbol):
     )
     m = re.search(r'="([^"]*)"', raw)
     if not m or not m.group(1):
-        raise RuntimeError("行情接口返回内容无法解析: {!r}".format(raw))
+        raise RuntimeError("行情接口返回内容无法解析")
     parts = m.group(1).split(",")
     if len(parts) < 14:
-        raise RuntimeError("行情字段数量异常: {}".format(parts))
+        raise RuntimeError("行情字段数量异常")
     return {
         "symbol": symbol,
-        # 新浪贵金属字段: 0=最新价 6=时间 7=昨收 12=日期 13=名称
         "name": parts[13] or symbol,
         "price": float(parts[0]),
         "time": parts[6],
@@ -118,10 +124,6 @@ def fetch_price(symbol):
 
 # ── 历史日线 ──────────────────────────────────────────────────────────────
 def fetch_history(days, breed="AU9999"):
-    """从新浪贵金属接口抓取近 days 天的日线，返回 list of dict：
-    [{date, open, high, low, close}, ...]  按日期倒序（最新在前）。
-    若抓取失败则返回空列表。
-    """
     end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
     url = HISTORY_URL.format(breed=breed, start=start, end=end)
@@ -129,7 +131,7 @@ def fetch_history(days, breed="AU9999"):
         req = urllib.request.Request(url, headers=HISTORY_HEADERS)
         raw = urllib.request.urlopen(req, timeout=15).read()
         text = raw.decode("gbk", errors="ignore")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log("历史日线抓取失败: {}: {}".format(type(e).__name__, e))
         return []
 
@@ -138,12 +140,11 @@ def fetch_history(days, breed="AU9999"):
         return []
 
     rows = []
-    for line in lines[1:]:  # 跳过表头
+    for line in lines[1:]:
         line = line.strip()
         if not line:
             continue
         fields = re.split(r"\s{2,}|\t+", line)
-        # 新浪返回用多个空格分隔
         if len(fields) < 6:
             continue
         try:
@@ -156,14 +157,11 @@ def fetch_history(days, breed="AU9999"):
             })
         except (ValueError, IndexError):
             continue
-
-    # 取最近 days 个交易日（已按日期倒序）
-    return rows[:days]
+    return rows[:days]  # 已按日期倒序
 
 
-# ── 分析 & 建议 ───────────────────────────────────────────────────────────
+# ── 历史位置分析 ───────────────────────────────────────────────────────────
 def analyze_price(history, current_price, days_label="60"):
-    """基于历史日线 + 当前价计算百分位和简易建议。"""
     result = {
         "days_label": days_label,
         "high": None,
@@ -184,13 +182,11 @@ def analyze_price(history, current_price, days_label="60"):
     result["low"] = low
 
     span = high - low
-    if span > 0:
-        percentile = (current_price - low) / span * 100
-    else:
-        percentile = 50.0
+    percentile = (current_price - low) / span * 100 if span > 0 else 50.0
     result["percentile"] = percentile
+    result["pct_vs_low"] = (current_price - low) / low * 100
+    result["pct_vs_high"] = (high - current_price) / high * 100
 
-    # 简易规则建议
     if percentile <= 20:
         result["advice"] = "✅ 历史低位（{:.0f}%），可考虑分批买入".format(percentile)
     elif percentile <= 40:
@@ -201,22 +197,118 @@ def analyze_price(history, current_price, days_label="60"):
         result["advice"] = "🟠 偏高位（{:.0f}%），谨慎追高".format(percentile)
     else:
         result["advice"] = "🔴 历史高位（{:.0f}%），注意回调风险".format(percentile)
-
-    # 额外补充：距 N 日最低还有多少空间
-    pct_vs_low = (current_price - low) / low * 100
-    pct_vs_high = (high - current_price) / high * 100
-    result["pct_vs_low"] = pct_vs_low
-    result["pct_vs_high"] = pct_vs_high
     return result
+
+
+# ── 技术指标 & 趋势判断 ────────────────────────────────────────────────────
+def calc_ma(closes, n):
+    """计算 N 日均线（简单平均）。closes 必须是时间正序（最早在前）。"""
+    if len(closes) < n:
+        return None
+    return sum(closes[-n:]) / n
+
+
+def calc_rsi(closes, period=14):
+    """相对强弱指标 RSI(period)，返回 0~100。closes 时间正序。"""
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(-diff)
+    # Wilder's 平均法
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def linear_slope(closes):
+    """收盘价线性回归斜率。返回每天的平均涨跌额。closes 时间正序。"""
+    n = len(closes)
+    if n < 2:
+        return 0.0
+    mean_x = (n - 1) / 2.0
+    mean_y = sum(closes) / n
+    num = sum((i - mean_x) * (closes[i] - mean_y) for i in range(n))
+    den = sum((i - mean_x) ** 2 for i in range(n))
+    return num / den if den else 0.0
+
+
+def analyze_trend(history):
+    """综合 MA 交叉 / RSI / 斜率 给出趋势判断。"""
+    trend = {
+        "ma5": None, "ma10": None, "ma20": None,
+        "ma_signal": "",
+        "rsi": None, "rsi_signal": "",
+        "slope_10": 0.0, "slope_10_signal": "",
+        "summary": "",
+    }
+    if not history or len(history) < 20:
+        trend["summary"] = "历史数据不足，无法判断趋势"
+        return trend
+
+    # history 是倒序，翻转得到时间正序
+    closes = [r["close"] for r in reversed(history)]
+
+    trend["ma5"] = calc_ma(closes, 5)
+    trend["ma10"] = calc_ma(closes, 10)
+    trend["ma20"] = calc_ma(closes, 20)
+
+    # MA 交叉信号
+    if trend["ma5"] and trend["ma10"]:
+        if trend["ma5"] > trend["ma10"] * 1.005:
+            trend["ma_signal"] = "🟢 MA5 > MA10，短期多头排列"
+        elif trend["ma5"] < trend["ma10"] * 0.995:
+            trend["ma_signal"] = "🔴 MA5 < MA10，短期空头排列"
+        else:
+            trend["ma_signal"] = "⚪ MA5 ≈ MA10，方向不明朗"
+
+    # RSI
+    trend["rsi"] = calc_rsi(closes, 14)
+    if trend["rsi"] is not None:
+        if trend["rsi"] >= 70:
+            trend["rsi_signal"] = "⚠️ RSI={:.0f} 超买，可能回调".format(trend["rsi"])
+        elif trend["rsi"] <= 30:
+            trend["rsi_signal"] = "💡 RSI={:.0f} 超卖，可能反弹".format(trend["rsi"])
+        else:
+            trend["rsi_signal"] = "➡️ RSI={:.0f} 中性".format(trend["rsi"])
+
+    # 近 10 日斜率
+    trend["slope_10"] = linear_slope(closes[-10:])
+    if trend["slope_10"] > 1.0:
+        trend["slope_10_signal"] = "📈 近10日呈上涨趋势（日均 +{:.2f}）".format(trend["slope_10"])
+    elif trend["slope_10"] < -1.0:
+        trend["slope_10_signal"] = "📉 近10日呈下跌趋势（日均 {:.2f}）".format(trend["slope_10"])
+    else:
+        trend["slope_10_signal"] = "➖ 近10日横盘震荡"
+
+    # 综合
+    signals = []
+    if trend["ma_signal"]:
+        signals.append(trend["ma_signal"])
+    if trend["slope_10_signal"]:
+        signals.append(trend["slope_10_signal"])
+    trend["summary"] = " ｜ ".join(signals)
+    return trend
 
 
 # ── 推送：Server酱（微信） ───────────────────────────────────────────────
 def push_serverchan(sendkey, title, desp):
-    """Server酱 微信推送。返回 True 成功 / False 跳过或失败。"""
     if not sendkey:
         log("未配置 serverchan_sendkey，跳过 Server酱 推送")
         return False
-    # Server酱 免费版 title <= 32 / desp <= 32KB
     if len(title) > 32:
         title = title[:31] + "…"
     data = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
@@ -228,12 +320,12 @@ def push_serverchan(sendkey, title, desp):
         resp = urllib.request.urlopen(req, timeout=15).read().decode("utf-8")
         obj = json.loads(resp)
         if obj.get("code") == 0:
-            log("Server酱推送成功: {}".format(obj.get("message", "")))
+            log("Server酱推送成功")
             return True
         else:
             log("Server酱推送失败: {}".format(resp))
             return False
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log("Server酱推送异常: {}: {}".format(type(e).__name__, e))
         return False
 
@@ -261,21 +353,23 @@ def push_mail(cfg, subject, html):
             server.sendmail(user, [to], msg.as_string())
         log("邮件已发送至 {}".format(to))
         return True
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log("邮件发送失败: {}: {}".format(type(e).__name__, e))
         return False
 
 
 # ── 消息体构建 ────────────────────────────────────────────────────────────
+DISCLAIMER = "_⚠️ 以上分析基于历史数据和技术指标，仅供参考，不构成投资建议。_"
+
+
 def build_title(info, threshold, triggered):
     price = info["price"]
     if triggered:
         return "【金价提醒】{:.2f} 低于阈值 {:.2f}".format(price, threshold)
-    return "【每日金价】{:.2f} 元/克".format(price)
+    return "【金价播报】{:.2f} 元/克".format(price)
 
 
-def build_markdown(info, analysis, threshold, triggered):
-    """Server酱/Markdown 消息体（微信推送用）。"""
+def build_markdown(info, analysis, trend, threshold, triggered):
     price = info["price"]
     prev = info["prev"]
     change = price - prev
@@ -284,152 +378,175 @@ def build_markdown(info, analysis, threshold, triggered):
     lines = []
     if triggered:
         lines.append("### 🔔 金价提醒")
-        lines.append("**现价 {:.2f} 元/克** 已低于你的阈值 {:.2f} 元/克！".format(price, threshold))
+        lines.append("**现价 {:.2f} 元/克** 已低于阈值 {:.2f}！".format(price, threshold))
     else:
-        lines.append("### 📊 每日金价播报")
+        lines.append("### 📊 金价播报")
         lines.append("**现价 {:.2f} 元/克**".format(price))
 
-    lines.append("")
     lines.append("**涨跌**: {:+.2f} ({:+.2f}%)".format(change, pct))
     lines.append("**阈值**: {:.2f} 元/克".format(threshold))
-    lines.append("")
 
-    # 历史分析
+    # 历史位置
     if analysis["high"] and analysis["low"]:
+        lines.append("")
         lines.append("---")
-        lines.append("### 📈 近 {} 日历史分析".format(analysis["days_label"]))
-        lines.append("- 区间最高: **{:.2f}**".format(analysis["high"]))
-        lines.append("- 区间最低: **{:.2f}**".format(analysis["low"]))
-        lines.append("- 当前位置: **{:.0f}%** (距最低 {:.1f}% / 距最高 {:.1f}%)".format(
-            analysis["percentile"],
-            analysis.get("pct_vs_low", 0),
-            analysis.get("pct_vs_high", 0),
-        ))
-        lines.append("- **建议**: {}".format(analysis["advice"]))
-    else:
-        lines.append("### 📈 历史分析")
-        lines.append(analysis["advice"])
+        lines.append("### 📍 历史位置（近 {} 日）".format(analysis["days_label"]))
+        lines.append("- 区间最高 **{:.2f}** ｜ 最低 **{:.2f}**".format(analysis["high"], analysis["low"]))
+        lines.append("- 当前位置 **{:.0f}%** (距最低 +{:.1f}% / 距最高 -{:.1f}%)".format(
+            analysis["percentile"], analysis.get("pct_vs_low", 0), analysis.get("pct_vs_high", 0)))
+        lines.append("- 💡 **{}**".format(analysis["advice"]))
 
+    # 趋势判断
+    lines.append("")
+    lines.append("---")
+    lines.append("### 📈 趋势判断（技术指标）")
+    if trend.get("ma5"):
+        lines.append("- MA5={:.2f}  MA10={:.2f}  MA20={:.2f}".format(
+            trend["ma5"], trend["ma10"], trend["ma20"]))
+    if trend.get("ma_signal"):
+        lines.append("- {}".format(trend["ma_signal"]))
+    if trend.get("rsi_signal"):
+        lines.append("- {}".format(trend["rsi_signal"]))
+    if trend.get("slope_10_signal"):
+        lines.append("- {}".format(trend["slope_10_signal"]))
+
+    lines.append("")
+    lines.append(DISCLAIMER)
     lines.append("")
     lines.append("_数据时间 {} {} ｜ 来源：新浪财经_".format(info["date"], info["time"]))
     return "\n".join(lines)
 
 
-def build_html(info, analysis, threshold, triggered):
-    """HTML 邮件消息体。"""
+def build_html(info, analysis, trend, threshold, triggered):
     price = info["price"]
     prev = info["prev"]
     change = price - prev
     pct = (change / prev * 100) if prev else 0.0
-    if change > 0:
-        chg_txt = "上涨 +{:.2f} ({:+.2f}%)".format(change, pct)
-    elif change < 0:
-        chg_txt = "下跌 {:.2f} ({:+.2f}%)".format(change, pct)
-    else:
-        chg_txt = "持平"
+    chg_txt = "上涨 +{:.2f} ({:+.2f}%)".format(change, pct) if change > 0 else \
+        ("下跌 {:.2f} ({:+.2f}%)".format(change, pct) if change < 0 else "持平")
 
     if triggered:
         accent = "#d93025"
-        title = "金价低于阈值提醒"
+        title_text = "金价低于阈值提醒"
         head = '<b style="color:#d93025;font-size:18px">🔔 金价提醒</b>'
     else:
         accent = "#1a7f37"
-        title = "每日金价播报"
-        head = '<b style="color:#1a7f37;font-size:18px">📊 每日金价播报</b>'
+        title_text = "金价播报"
+        head = '<b style="color:#1a7f37;font-size:18px">📊 金价播报</b>'
 
-    # 历史分析区
+    # 历史位置区
     hist_block = ""
     if analysis["high"] and analysis["low"]:
         hist_block = """
         <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
-        <p style="margin:0">
-          <b>📈 近 {days} 日历史分析</b><br>
-          区间最高 <b>{high:.2f}</b> ｜ 区间最低 <b>{low:.2f}</b><br>
+        <p style="margin:0;font-size:14px;line-height:1.9">
+          <b>📍 历史位置（近 {days} 日）</b><br>
+          区间最高 <b>{high:.2f}</b> ｜ 最低 <b>{low:.2f}</b><br>
           当前位置 <b style="color:{accent}">{pct:.0f}%</b>
           (距最低 +{vs_low:.1f}% / 距最高 -{vs_high:.1f}%)<br>
           💡 <b>{advice}</b>
-        </p>
-        """.format(
-            days=analysis["days_label"],
-            high=analysis["high"],
-            low=analysis["low"],
-            pct=analysis["percentile"],
-            vs_low=analysis.get("pct_vs_low", 0),
-            vs_high=analysis.get("pct_vs_high", 0),
-            advice=analysis["advice"],
-            accent=accent,
-        )
+        </p>""".format(
+            days=analysis["days_label"], high=analysis["high"], low=analysis["low"],
+            pct=analysis["percentile"], vs_low=analysis.get("pct_vs_low", 0),
+            vs_high=analysis.get("pct_vs_high", 0), advice=analysis["advice"], accent=accent)
 
-    html = f"""<div style="font-family:Arial,'Microsoft YaHei',sans-serif;max-width:520px">
+    # 趋势区
+    trend_block = ""
+    if trend.get("summary"):
+        rsi_txt = trend.get("rsi_signal", "")
+        ma_txt = trend.get("ma_signal", "")
+        slope_txt = trend.get("slope_10_signal", "")
+        ma_vals = ""
+        if trend.get("ma5"):
+            ma_vals = "MA5={:.2f}  MA10={:.2f}  MA20={:.2f}".format(
+                trend["ma5"], trend["ma10"], trend["ma20"])
+        trend_block = """
+        <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
+        <p style="margin:0;font-size:14px;line-height:1.9">
+          <b>📈 趋势判断（技术指标）</b><br>
+          {ma_vals}<br>
+          {ma_txt}<br>
+          {slope_txt}<br>
+          {rsi_txt}
+        </p>
+        <p style="color:#999;font-size:11px;margin:6px 0 0 0">⚠️ 以上分析基于历史数据和技术指标，仅供参考，不构成投资建议。</p>""".format(
+            ma_vals=ma_vals, ma_txt=ma_txt, slope_txt=slope_txt, rsi_txt=rsi_txt)
+
+    html = f"""<div style="font-family:Arial,'Microsoft YaHei',sans-serif;max-width:560px">
   {head}
-  <h2 style="color:{accent};margin:4px 0 12px 0">{title}</h2>
+  <h2 style="color:{accent};margin:4px 0 12px 0">{title_text}</h2>
   <p style="font-size:15px;line-height:1.9;margin:0">
     现价：<b style="color:{accent};font-size:20px">{price:.2f} 元/克</b><br>
     较昨收：{chg_txt}<br>
     你的阈值：{threshold:.2f} 元/克
   </p>
   {hist_block}
+  {trend_block}
   <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
   <p style="color:#888;font-size:12px;margin:0">数据时间 {info['date']} {info['time']} ｜ 来源：新浪财经</p>
 </div>"""
-    return title, html
+    return title_text, html
 
 
 # ── 主流程 ───────────────────────────────────────────────────────────────
 def main():
     cfg = load_config()
     threshold = float(cfg.get("threshold", 0))
-    alert_once_per_day = bool(cfg.get("alert_once_per_day", True))
+    cooldown_minutes = int(cfg.get("alert_cooldown_minutes", 60))
     history_days = int(cfg.get("history_days", 60))
     symbol = cfg.get("symbol", "gds_AU9999")
     sendkey = env_or_cfg(cfg, "serverchan_sendkey", "SERVERCHAN_SENDKEY")
 
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+
         info = fetch_price(symbol)
         triggered = info["price"] < threshold
-        log(
-            "{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 触发={}".format(
-                info["name"], info["price"], threshold, triggered
-            )
-        )
+        log("{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 触发={}".format(
+            info["name"], info["price"], threshold, triggered))
 
-        # 历史分析
+        # 历史 + 趋势
         history = fetch_history(history_days)
         analysis = analyze_price(history, info["price"], str(history_days))
+        trend = analyze_trend(history)
+
         if analysis["percentile"] is not None:
-            log(
-                "近 {}日 高 {:.2f} / 低 {:.2f} / 当前位置 {:.0f}%".format(
-                    analysis["days_label"],
-                    analysis["high"],
-                    analysis["low"],
-                    analysis["percentile"],
-                )
-            )
-        log("建议: {}".format(analysis["advice"]))
+            log("近 {}日 高 {:.2f} / 低 {:.2f} / 位置 {:.0f}%".format(
+                analysis["days_label"], analysis["high"], analysis["low"], analysis["percentile"]))
+        if trend["summary"]:
+            log("趋势: {}".format(trend["summary"]))
+        if trend.get("rsi") is not None:
+            log("RSI(14) = {:.1f}".format(trend["rsi"]))
 
         state = load_state()
         sent_any = False
 
-        # 1) 跌破阈值 → 立即提醒
-        if triggered and (
-            not alert_once_per_day or state.get("last_alert_date") != today
-        ):
+        # 1) 跌破阈值 → 检查冷却时间
+        last_alert = parse_ts(state.get("last_alert_ts"))
+        cooldown_ok = (last_alert is None or
+                       (now - last_alert).total_seconds() >= cooldown_minutes * 60)
+
+        if triggered and cooldown_ok:
             title = build_title(info, threshold, True)
-            md = build_markdown(info, analysis, threshold, True)
-            _, html = build_html(info, analysis, threshold, True)
+            md = build_markdown(info, analysis, trend, threshold, True)
+            _, html = build_html(info, analysis, trend, threshold, True)
             push_serverchan(sendkey, title, md)
             push_mail(cfg, title, html)
+            state["last_alert_ts"] = now.isoformat()
             state["last_alert_date"] = today
             sent_any = True
-            log("跌破阈值提醒已推送")
+            log("跌破阈值提醒已推送（冷却 {} 分钟）".format(cooldown_minutes))
+        elif triggered and not cooldown_ok:
+            remaining = cooldown_minutes * 60 - int((now - last_alert).total_seconds())
+            log("跌破阈值但冷却中，剩余 {} 秒".format(remaining))
 
         # 2) 每天第一次运行 → 每日播报（若本次已发提醒则不重复发）
         if state.get("last_digest_date") != today:
             if not sent_any:
                 title = build_title(info, threshold, False)
-                md = build_markdown(info, analysis, threshold, False)
-                _, html = build_html(info, analysis, threshold, False)
+                md = build_markdown(info, analysis, trend, threshold, False)
+                _, html = build_html(info, analysis, trend, threshold, False)
                 push_serverchan(sendkey, title, md)
                 push_mail(cfg, title, html)
                 sent_any = True
@@ -438,9 +555,10 @@ def main():
 
         save_state(state)
         if not sent_any:
-            log("本次无需发送（今日已播报，且现价未跌破阈值）")
+            log("本次无需发送（今日已播报，{}）".format(
+                "现价未跌破阈值" if not triggered else "提醒冷却中"))
         return 0
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log("执行失败: {}: {}".format(type(e).__name__, e))
         return 1
 

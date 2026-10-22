@@ -3,10 +3,8 @@ name: Gold Price Alert
 on:
   schedule:
     # 注意：GitHub Actions cron 是 UTC 时区，北京时间 = UTC + 8
-    # 北京时间 10:00 → UTC 02:00
-    # 北京时间 14:00 → UTC 06:00
-    # 北京时间 20:00 → UTC 12:00
-    - cron: "0 2,6,12 * * *"
+    # */15 表示每 15 分钟运行一次（24 小时不间断）
+    - cron: "*/15 * * * *"
   workflow_dispatch:  # 允许手动触发测试
 
 permissions:
@@ -24,7 +22,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 从上一次运行恢复 state.json（实现"每天只发一次播报"的幂等性）
+      # 从上一次运行恢复 state.json（实现冷却/每日播报幂等性）
       - name: Restore state
         uses: actions/download-artifact@v4
         continue-on-error: true

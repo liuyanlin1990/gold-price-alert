@@ -1,5 +1,5 @@
 {
-  "_说明": "每天第一次运行发「每日播报」；之后运行只有现价跌破 threshold 才发「金价提醒」。alert_once_per_day=true 同一天最多发一次跌破提醒。历史分析取 history_days 天数据。敏感字段(auth_code/sendkey)若设置了同名环境变量会优先读取环境变量，方便云端部署。",
+  "_说明": "每 15 分钟运行一次。每天第一次发「每日播报」；之后只有现价跌破 threshold 才发「金价提醒」。alert_cooldown_minutes 是跌破提醒的冷却时间（分钟），避免轰炸。敏感字段(auth_code/sendkey)若设置了同名环境变量会优先读取环境变量。",
   "smtp_host": "smtp.qq.com",
   "smtp_port": 465,
   "smtp_user": "503777619@qq.com",
@@ -7,12 +7,12 @@
   "mail_to": "503777619@qq.com",
   "symbol": "gds_AU9999",
   "threshold": 880.0,
-  "check_times": ["10:00", "14:00", "20:00"],
-  "alert_once_per_day": true,
+  "check_times": ["每15分钟"],
+  "alert_cooldown_minutes": 60,
 
-  "_历史分析": "近 history_days 天的最高最低 + 当前价在区间的百分位，帮你判断是高位还是低位",
+  "_历史分析": "近 history_days 天的最高最低 + 当前价在区间的百分位 + MA均线 + RSI趋势判断",
   "history_days": 60,
 
   "_Server酱推送": "关注微信公众号「方糖」，到 sct.ftqq.com 登录后获取 SendKey；留空则跳过 Server酱 推送",
-  "serverchan_sendkey": ""
+  "serverchan_sendkey": "SCT446957T0S71CPpIdPn2VjyUA0nsXyCU"
 }
