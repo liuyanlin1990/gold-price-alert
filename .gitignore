@@ -1,0 +1,5 @@
+# 敏感文件 —— 本地运行才会生成，绝不推到云端
+state.json
+logs/
+__pycache__/
+*.pyc

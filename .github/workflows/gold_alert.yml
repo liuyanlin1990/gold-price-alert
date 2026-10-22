@@ -1,0 +1,57 @@
+name: Gold Price Alert
+
+on:
+  schedule:
+    # 注意：GitHub Actions cron 是 UTC 时区，北京时间 = UTC + 8
+    # 北京时间 10:00 → UTC 02:00
+    # 北京时间 14:00 → UTC 06:00
+    # 北京时间 20:00 → UTC 12:00
+    - cron: "0 2,6,12 * * *"
+  workflow_dispatch:  # 允许手动触发测试
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 从上一次运行恢复 state.json（实现"每天只发一次播报"的幂等性）
+      - name: Restore state
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: gold-state
+          path: .
+
+      - name: Run gold_alert.py
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_AUTH_CODE: ${{ secrets.SMTP_AUTH_CODE }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: python gold_alert.py
+
+      # 上传 state.json 供下次运行恢复（保留 14 天）
+      - name: Upload state
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-state
+          path: state.json
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-logs
+          path: logs/run.log
+          retention-days: 7
