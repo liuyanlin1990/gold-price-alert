@@ -23,7 +23,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate
@@ -33,6 +33,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+# 北京时区：新浪报价时间戳是北京时间，GitHub 服务器时钟是 UTC，
+# 所有「现在 vs 报价时间」的比较必须统一到北京时间，否则休市判断会失效
+BJT = timezone(timedelta(hours=8))
 
 # ── 新浪接口 ──────────────────────────────────────────────────────────────
 SINA_URL = "https://hq.sinajs.cn/list={symbol}"
@@ -50,7 +54,7 @@ HISTORY_HEADERS = {"User-Agent": "Mozilla/5.0"}
 # ── 基础工具 ──────────────────────────────────────────────────────────────
 def log(msg):
     os.makedirs(LOG_DIR, exist_ok=True)
-    line = "[{}] {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    line = "[{}] {}".format(datetime.now(BJT).strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line)
     try:
         with open(os.path.join(LOG_DIR, "run.log"), "a", encoding="utf-8") as f:
@@ -95,9 +99,13 @@ def parse_ts(ts_str):
     if not ts_str:
         return None
     try:
-        return datetime.fromisoformat(ts_str)
+        dt = datetime.fromisoformat(ts_str)
     except Exception:
         return None
+    if dt.tzinfo is None:
+        # 旧版 state 里的 naive 时间戳是 UTC（GitHub 服务器时钟），补上时区再比较
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # ── 实时行情 ──────────────────────────────────────────────────────────────
@@ -121,6 +129,37 @@ def fetch_price(symbol):
         "time": parts[6],
         "prev": float(parts[7]) if parts[7] else float(parts[0]),
         "date": parts[12],
+    }
+
+
+# ── 备用行情源 ────────────────────────────────────────────────────────────
+def fetch_price_fallback():
+    """备用源：上期所沪金主力连续（nf_AU0）。
+
+    上金所（gds_）数据源偶发冻结（盘中停止更新），而沪金期货与上金所现货
+    价差通常只有几个点，且交易时段完全一致，是最接近的替代源。
+    """
+    req = urllib.request.Request(
+        SINA_URL.format(symbol="nf_AU0"), headers=SINA_HEADERS
+    )
+    raw = urllib.request.urlopen(req, timeout=15).read().decode(
+        "gb2312", errors="ignore"
+    )
+    m = re.search(r'="([^"]*)"', raw)
+    if not m or not m.group(1):
+        raise RuntimeError("备用源返回内容无法解析")
+    parts = m.group(1).split(",")
+    if len(parts) < 18:
+        raise RuntimeError("备用源字段数量异常")
+    t = parts[1]
+    time_str = "{}:{}:{}".format(t[:2], t[2:4], t[4:6]) if len(t) >= 6 else t
+    return {
+        "symbol": "nf_AU0",
+        "name": "沪金期货(备用源)",
+        "price": float(parts[8]),
+        "time": time_str,
+        "prev": float(parts[10]) if parts[10] else float(parts[8]),
+        "date": parts[17],
     }
 
 
@@ -185,7 +224,7 @@ def analyze_price(history, current_price, days_label="60"):
 
     span = high - low
     percentile = (current_price - low) / span * 100 if span > 0 else 50.0
-    result["percentile"] = percentile
+    result["percentile"] = max(0.0, min(100.0, percentile))
     result["pct_vs_low"] = (current_price - low) / low * 100
     result["pct_vs_high"] = (high - current_price) / high * 100
 
@@ -336,9 +375,9 @@ def push_serverchan(sendkey, title, desp):
 def push_mail(cfg, subject, html):
     host = cfg.get("smtp_host", "smtp.qq.com")
     port = int(cfg.get("smtp_port", 465))
-    user = env_or_cfg(cfg, "smtp_user")
+    user = env_or_cfg(cfg, "smtp_user", "SMTP_USER")
     auth_code = env_or_cfg(cfg, "smtp_auth_code", "SMTP_AUTH_CODE")
-    to = env_or_cfg(cfg, "mail_to") or user
+    to = env_or_cfg(cfg, "mail_to", "MAIL_TO") or user
     if not user or not auth_code:
         log("未配置 smtp_user / smtp_auth_code，跳过邮件发送")
         return False
@@ -423,7 +462,8 @@ def build_markdown(info, analysis, trend, threshold, kind):
     lines.append("")
     lines.append(DISCLAIMER)
     lines.append("")
-    lines.append("_数据时间 {} {} ｜ 来源：新浪财经_".format(info["date"], info["time"]))
+    lines.append("_数据时间 {} {} ｜ {} ｜ 来源：新浪财经_".format(
+        info["date"], info["time"], info["name"]))
     return "\n".join(lines)
 
 
@@ -500,7 +540,7 @@ def build_html(info, analysis, trend, threshold, kind):
   {hist_block}
   {trend_block}
   <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
-  <p style="color:#888;font-size:12px;margin:0">数据时间 {info['date']} {info['time']} ｜ 来源：新浪财经</p>
+  <p style="color:#888;font-size:12px;margin:0">数据时间 {info['date']} {info['time']} ｜ {info['name']} ｜ 来源：新浪财经</p>
 </div>"""
     return title_text, html
 
@@ -542,26 +582,38 @@ def check_once(cfg, state):
     symbol = cfg.get("symbol", "gds_AU9999")
     sendkey = env_or_cfg(cfg, "serverchan_sendkey", "SERVERCHAN_SENDKEY")
 
-    now = datetime.now()
+    now = datetime.now(BJT)
     today = now.strftime("%Y-%m-%d")
 
+    def _stale(quote):
+        """报价时间超过 20 分钟未更新 = 休市或数据源故障。"""
+        try:
+            qdt = datetime.strptime(
+                quote["date"] + " " + quote["time"], "%Y-%m-%d %H:%M:%S")
+            return (now - qdt.replace(tzinfo=BJT)).total_seconds() > 20 * 60
+        except (ValueError, KeyError):
+            return False
+
     info = fetch_price(symbol)
+    if _stale(info):
+        log("上金所行情陈旧（报价 {} {}，休市或数据源故障），尝试备用源…".format(
+            info["date"], info["time"]))
+        try:
+            fb = fetch_price_fallback()
+        except Exception as e:
+            log("备用源抓取失败: {}: {}，跳过本次判断".format(type(e).__name__, e))
+            return False
+        if _stale(fb):
+            log("备用源也陈旧（报价 {} {}），跳过本次判断".format(fb["date"], fb["time"]))
+            return False
+        info = fb
+        log("已切换备用源 {}".format(fb["name"]))
+
     price = info["price"]
     below = price < threshold
     near = (not below) and (price - threshold <= near_margin)
     log("{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 跌破={} | 接近={}".format(
         info["name"], price, threshold, below, near))
-
-    # 休市判断：报价时间超过 20 分钟未更新，说明金交所已收盘，避免用冻结价反复报警
-    try:
-        quote_dt = datetime.strptime(
-            info["date"] + " " + info["time"], "%Y-%m-%d %H:%M:%S")
-        if (now - quote_dt).total_seconds() > 20 * 60:
-            log("行情未更新（报价 {} {}，休市中），跳过本次判断".format(
-                info["date"], info["time"]))
-            return False
-    except (ValueError, KeyError):
-        pass
 
     sent_any = False
 
