@@ -19,6 +19,7 @@ import json
 import os
 import re
 import smtplib
+import ssl
 import sys
 import time
 import urllib.parse
@@ -49,6 +50,12 @@ HISTORY_URL = (
     "download_gold_history.php?breed={breed}&start={start}&end={end}"
 )
 HISTORY_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# 工行「积存金行情查询」页（官方实时报价）
+ICBC_URL = (
+    "https://icbcphp.icbc.com.cn/icbc/newperbank/perbank3/gold/"
+    "goldaccrual_query_out.jsp"
+)
 
 
 # ── 基础工具 ──────────────────────────────────────────────────────────────
@@ -129,6 +136,40 @@ def fetch_price(symbol):
         "time": parts[6],
         "prev": float(parts[7]) if parts[7] else float(parts[0]),
         "date": parts[12],
+    }
+
+
+# ── 工行积存金官方行情 ────────────────────────────────────────────────────
+def fetch_icbc():
+    """抓取工行「积存金行情查询」页的实时主动积存价格。
+
+    该站点仅支持旧版 TLS 重协商，需显式开启 OP_LEGACY_SERVER_CONNECT。
+    """
+    ctx = ssl.create_default_context()
+    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    req = urllib.request.Request(
+        ICBC_URL, headers={"User-Agent": "Mozilla/5.0"}
+    )
+    raw = urllib.request.urlopen(req, timeout=20, context=ctx).read()
+    text = raw.decode("gbk", errors="ignore")
+
+    m = re.search(r'id="activeprice_\d+"[^>]*>\s*([\d.]+)\s*<', text)
+    if not m:
+        raise RuntimeError("工行积存金价格解析失败")
+    t = re.search(
+        r"更新时间[:：]\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", text)
+    if not t:
+        raise RuntimeError("工行积存金更新时间解析失败")
+    price = float(m.group(1))
+    return {
+        "symbol": "ICBC_ACCRUAL",
+        "name": "工行积存金",
+        "price": price,
+        "time": t.group(2),
+        "prev": price,
+        "date": t.group(1),
+        "source": "工商银行",
     }
 
 
@@ -404,24 +445,31 @@ DISCLAIMER = "_⚠️ 以上分析基于历史数据和技术指标，仅供参�
 
 
 def build_title(info, threshold, kind):
-    price = info["price"]
+    price = info.get("icbc", info["price"])
+    thr = threshold
+    label = "积存金" if info.get("icbc") is not None else "金价"
     if kind == "alert":
-        return "【金价提醒】{:.2f} 低于阈值 {:.2f}".format(price, threshold)
+        return "【买入提醒】{} {:.2f} 低于阈值 {:.2f}".format(label, price, thr)
+    if kind == "sell":
+        return "【卖出提醒】{} {:.2f} 高于阈值 {:.2f}".format(label, price, thr)
     if kind == "near":
-        return "【接近阈值】{:.2f} 元/克".format(price)
-    return "【金价播报】{:.2f} 元/克".format(price)
+        return "【接近阈值】{} {:.2f} 元/克".format(label, price)
+    return "【每日播报】{} {:.2f} 元/克".format(label, price)
 
 
 def build_markdown(info, analysis, trend, threshold, kind):
-    price = info["price"]
+    price = info.get("icbc", info["price"])
     prev = info["prev"]
     change = price - prev
     pct = (change / prev * 100) if prev else 0.0
 
     lines = []
     if kind == "alert":
-        lines.append("### 🔔 金价提醒")
-        lines.append("**现价 {:.2f} 元/克** 已低于阈值 {:.2f}！".format(price, threshold))
+        lines.append("### 🔔 买入提醒")
+        lines.append("**现价 {:.2f} 元/克** 已低于买入阈值 {:.2f}！".format(price, threshold))
+    elif kind == "sell":
+        lines.append("### 💰 卖出提醒")
+        lines.append("**现价 {:.2f} 元/克** 已高于卖出阈值 {:.2f}！".format(price, threshold))
     elif kind == "near":
         lines.append("### ⚠️ 接近阈值")
         lines.append("**现价 {:.2f} 元/克**，距阈值 {:.2f} 仅差 {:.2f} 元".format(
@@ -432,8 +480,8 @@ def build_markdown(info, analysis, trend, threshold, kind):
 
     lines.append("**涨跌**: {:+.2f} ({:+.2f}%)".format(change, pct))
     lines.append("**阈值**: {:.2f} 元/克".format(threshold))
-    if info.get("icbc") is not None:
-        lines.append("**工行积存金参考**: {:.2f} 元/克".format(info["icbc"]))
+    if info.get("base_price") is not None:
+        lines.append("**沪金99（基准）**: {:.2f} 元/克".format(info["base_price"]))
 
     # 历史位置
     if analysis["high"] and analysis["low"]:
@@ -462,25 +510,30 @@ def build_markdown(info, analysis, trend, threshold, kind):
     lines.append("")
     lines.append(DISCLAIMER)
     lines.append("")
-    lines.append("_数据时间 {} {} ｜ {} ｜ 来源：新浪财经_".format(
-        info["date"], info["time"], info["name"]))
+    lines.append("_数据时间 {} {} ｜ {} ｜ 来源：{}_".format(
+        info["date"], info["time"], info["name"],
+        info.get("source", "新浪财经")))
     return "\n".join(lines)
 
 
 def build_html(info, analysis, trend, threshold, kind):
-    price = info["price"]
+    price = info.get("icbc", info["price"])
     prev = info["prev"]
     change = price - prev
     pct = (change / prev * 100) if prev else 0.0
     chg_txt = "上涨 +{:.2f} ({:+.2f}%)".format(change, pct) if change > 0 else \
         ("下跌 {:.2f} ({:+.2f}%)".format(change, pct) if change < 0 else "持平")
-    icbc_txt = ("{:.2f} 元/克".format(info["icbc"])
-                if info.get("icbc") is not None else "—")
+    base_txt = ("{:.2f} 元/克".format(info["base_price"])
+                if info.get("base_price") is not None else "—")
 
     if kind == "alert":
         accent = "#d93025"
-        title_text = "金价低于阈值提醒"
-        head = '<b style="color:#d93025;font-size:18px">🔔 金价提醒</b>'
+        title_text = "金价低于买入阈值提醒"
+        head = '<b style="color:#d93025;font-size:18px">🔔 买入提醒</b>'
+    elif kind == "sell":
+        accent = "#1a56db"
+        title_text = "金价高于卖出阈值提醒"
+        head = '<b style="color:#1a56db;font-size:18px">💰 卖出提醒</b>'
     elif kind == "near":
         accent = "#b26a00"
         title_text = "金价接近阈值提醒"
@@ -535,12 +588,12 @@ def build_html(info, analysis, trend, threshold, kind):
     现价：<b style="color:{accent};font-size:20px">{price:.2f} 元/克</b><br>
     较昨收：{chg_txt}<br>
     你的阈值：{threshold:.2f} 元/克<br>
-    工行积存金参考：{icbc_txt}
+    沪金99（基准）：{base_txt}
   </p>
   {hist_block}
   {trend_block}
   <hr style="border:none;border-top:1px solid #eee;margin:14px 0">
-  <p style="color:#888;font-size:12px;margin:0">数据时间 {info['date']} {info['time']} ｜ {info['name']} ｜ 来源：新浪财经</p>
+  <p style="color:#888;font-size:12px;margin:0">数据时间 {info['date']} {info['time']} ｜ {info['name']} ｜ 来源：{info.get('source', '新浪财经')}</p>
 </div>"""
     return title_text, html
 
@@ -560,10 +613,12 @@ def send_message(cfg, info, kind, threshold, history_days, sendkey):
     if trend.get("rsi") is not None:
         log("RSI(14) = {:.1f}".format(trend["rsi"]))
 
-    # 工行积存金参考价（= 沪金99 + icbc_spread）
-    spread = float(cfg.get("icbc_spread", 0) or 0)
-    if spread:
+    # 兜底：未拿到工行官方价时，用 沪金99 + 价差 估算
+    if info.get("icbc") is None:
+        spread = float(cfg.get("icbc_spread", 0) or 0)
+        info["base_price"] = info["price"]
         info["icbc"] = info["price"] + spread
+        info["icbc_threshold"] = threshold
 
     title = build_title(info, threshold, kind)
     md = build_markdown(info, analysis, trend, threshold, kind)
@@ -579,6 +634,7 @@ def check_once(cfg, state):
     cooldown_minutes = int(cfg.get("alert_cooldown_minutes", 60))
     history_days = int(cfg.get("history_days", 60))
     near_margin = float(cfg.get("near_threshold_margin", 2.0))
+    sell_threshold = float(cfg.get("sell_threshold", 0) or 0)
     symbol = cfg.get("symbol", "gds_AU9999")
     sendkey = env_or_cfg(cfg, "serverchan_sendkey", "SERVERCHAN_SENDKEY")
 
@@ -594,26 +650,49 @@ def check_once(cfg, state):
         except (ValueError, KeyError):
             return False
 
-    info = fetch_price(symbol)
-    if _stale(info):
-        log("上金所行情陈旧（报价 {} {}，休市或数据源故障），尝试备用源…".format(
-            info["date"], info["time"]))
-        try:
-            fb = fetch_price_fallback()
-        except Exception as e:
-            log("备用源抓取失败: {}: {}，跳过本次判断".format(type(e).__name__, e))
-            return False
-        if _stale(fb):
-            log("备用源也陈旧（报价 {} {}），跳过本次判断".format(fb["date"], fb["time"]))
-            return False
-        info = fb
-        log("已切换备用源 {}".format(fb["name"]))
+    # 主数据源：工行官方积存金实时价
+    info = None
+    try:
+        icbc = fetch_icbc()
+    except Exception as e:
+        icbc = None
+        log("工行积存金行情抓取失败: {}: {}".format(type(e).__name__, e))
 
-    price = info["price"]
+    if icbc and not _stale(icbc):
+        info = icbc
+        info["icbc"] = icbc["price"]
+        info["icbc_threshold"] = threshold
+        log("数据源：工行积存金官方报价")
+    else:
+        if icbc:
+            log("工行积存金行情陈旧（报价 {} {}），改用沪金99…".format(
+                icbc["date"], icbc["time"]))
+        info = fetch_price(symbol)
+        if _stale(info):
+            log("上金所行情陈旧（报价 {} {}，休市或数据源故障），尝试备用源…".format(
+                info["date"], info["time"]))
+            try:
+                fb = fetch_price_fallback()
+            except Exception as e:
+                log("备用源抓取失败: {}: {}，跳过本次判断".format(type(e).__name__, e))
+                return False
+            if _stale(fb):
+                log("备用源也陈旧（报价 {} {}），跳过本次判断".format(fb["date"], fb["time"]))
+                return False
+            info = fb
+            log("已切换备用源 {}".format(fb["name"]))
+        spread = float(cfg.get("icbc_spread", 0) or 0)
+        info["base_price"] = info["price"]
+        info["icbc"] = info["price"] + spread
+        info["icbc_threshold"] = threshold
+        info["source"] = "新浪财经（积存金为推算值）"
+
+    price = info.get("icbc", info["price"])
     below = price < threshold
+    above = sell_threshold > 0 and price >= sell_threshold
     near = (not below) and (price - threshold <= near_margin)
-    log("{} 现价 {:.2f} 元/克 | 阈值 {:.2f} | 跌破={} | 接近={}".format(
-        info["name"], price, threshold, below, near))
+    log("{} 现价 {:.2f} 元/克 | 买入阈值 {:.2f} | 卖出阈值 {:.2f} | 跌破={} | 高于={} | 接近={}".format(
+        info["name"], price, threshold, sell_threshold, below, above, near))
 
     sent_any = False
 
@@ -632,7 +711,21 @@ def check_once(cfg, state):
             remaining = cooldown_minutes * 60 - int((now - last_alert).total_seconds())
             log("跌破阈值但冷却中，剩余 {} 秒".format(max(remaining, 0)))
 
-    # 2) 每天第一条：每日播报（本次已发提醒则不重复）
+    # 2) 高于卖出阈值 → 冷却判断
+    if above:
+        last_sell = parse_ts(state.get("last_sell_ts"))
+        sell_ok = (last_sell is None or
+                   (now - last_sell).total_seconds() >= cooldown_minutes * 60)
+        if sell_ok:
+            send_message(cfg, info, "sell", sell_threshold, history_days, sendkey)
+            state["last_sell_ts"] = now.isoformat()
+            sent_any = True
+            log("高于卖出阈值提醒已推送（冷却 {} 分钟）".format(cooldown_minutes))
+        else:
+            remaining = cooldown_minutes * 60 - int((now - last_sell).total_seconds())
+            log("高于卖出阈值但冷却中，剩余 {} 秒".format(max(remaining, 0)))
+
+    # 3) 每天第一条：每日播报（本次已发提醒则不重复）
     if state.get("last_digest_date") != today:
         if not sent_any:
             send_message(cfg, info, "digest", threshold, history_days, sendkey)
@@ -640,7 +733,7 @@ def check_once(cfg, state):
             log("每日播报已推送")
         state["last_digest_date"] = today
 
-    # 3) 接近阈值（每天最多提醒一次）
+    # 4) 接近阈值（每天最多提醒一次）
     elif near and state.get("last_near_date") != today:
         send_message(cfg, info, "near", threshold, history_days, sendkey)
         state["last_near_date"] = today
@@ -648,8 +741,9 @@ def check_once(cfg, state):
 
     if not sent_any:
         log("本次无需发送（今日已播报，{}）".format(
-            "跌破但冷却中" if below else "未跌破阈值"))
-    return below and sent_any
+            "跌破但冷却中" if below else
+            ("高于卖出阈值但冷却中" if above else "未触发阈值")))
+    return (below or above) and sent_any
 
 
 # ── 主流程 ───────────────────────────────────────────────────────────────
